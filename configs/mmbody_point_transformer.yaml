@@ -1,0 +1,21 @@
+data:
+    dataset: "mmPoseNLP"
+    # dataset: "MMFi"
+    # dataset_root: "../mmfi/MMFi_dataset/MMFi_Dataset/Unzipfiles"
+    # dataset: "MMBody"
+    # dataset_root: "../mmBody"
+    num_joints: 17
+    radar_input_c: 3
+
+train: 
+    batch_size: 16
+    n_epochs: 100
+    learning_rate: 0.0001
+    weight_decay: 0.00000001
+    save_model_root: "/data_ssd/zqh/seq2seq_data/point_cloud/mmwave_pic/checkpoints_train5-10-20cm_test25cm_all"
+    gradient_clipping: 1.0
+    test_freq: 10
+    amp: False
+
+model:
+    model: "PointTransformer"
