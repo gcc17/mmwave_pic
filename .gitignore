@@ -1,6 +1,8 @@
 *.npy
 images*
 checkpoints*
+*logs
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

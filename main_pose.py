@@ -4,23 +4,64 @@ import yaml
 import torch
 import datasets
 import models
-from utils import dict2namespace, AverageMeter
+from utils import dict2namespace, AverageMeter, get_current_time
 from torch.utils.data import DataLoader
 from torch import optim
 import torch.nn as nn
 from tqdm import tqdm
 from torch.nn.utils import clip_grad_norm_
 from models.loss import mpjpe, p_mpjpe
+from torch.utils.tensorboard import SummaryWriter
+import logging
+import sys
+
+CURRENT_TIME: str = get_current_time()
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='configs/mmbody_point_transformer.yaml', help='path to config file')
+    parser.add_argument('--model_ckpt_path', type=str, default=None, help='Path to the model checkpoint to load.')
     args = parser.parse_args()
     
     # parse config file
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
     config = dict2namespace(config)
+    
+    # set up logging
+    log_dir = 'pic_logs'
+    os.makedirs(log_dir, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s, %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
+        datefmt='%Y-%m-%d:%H:%M:%S',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(f"{log_dir}/{CURRENT_TIME}.txt", mode="w", encoding="utf-8")
+        ]
+    )
+    logger = logging.getLogger(__name__)
+    logger.info(config)
+    
+    # set up tensorboard
+    if isinstance(config.data.train_noise_level, list):
+        train_noise_name = '_'.join([str(n) for n in config.data.train_noise_level])
+    else:
+        train_noise_name = config.data.train_noise_level
+    if isinstance(config.data.test_noise_level, list):
+        test_noise_name = '_'.join([str(n) for n in config.data.test_noise_level])
+    else:
+        test_noise_name = config.data.test_noise_level
+    if not config.data.dataset == 'mmPoseNLP':
+        checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
+            f'{config.data.dataset}-{config.model.model}-{CURRENT_TIME}')
+    else:
+        checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
+            f'{config.data.dataset}-{config.model.model}-trainnoise{train_noise_name}-testnoise{test_noise_name}-{CURRENT_TIME}')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=checkpoint_dir)
+    logger.info(f"Writing tensorboard logs to {checkpoint_dir}")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # load dataset
@@ -39,22 +80,18 @@ if __name__ == '__main__':
         train_dataset = datasets.__dict__[config.data.dataset](train_data_path, noise_level=[0.05,0.1,0.2])
         test_dataset = datasets.__dict__[config.data.dataset](test_data_path, noise_level=0.25)
         
-    print(len(train_dataset), len(test_dataset))
+    logger.info(f"Training on {len(train_dataset)} samples, Testing on {len(test_dataset)} samples")
     train_loader = DataLoader(train_dataset, batch_size=config.train.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=config.train.batch_size, shuffle=False)
     
     # set up model
     model = models.__dict__[config.model.model](input_dim=config.data.radar_input_c, n_p=config.data.num_joints).to(device)
-    print(model)
+    # print(model)
     # set up optimizer
     optimizer = optim.Adam(model.parameters(),
                            lr=config.train.learning_rate, weight_decay=config.train.weight_decay, foreach=True)
     grad_scaler = torch.cuda.amp.GradScaler(enabled=config.train.amp)
     criterion = nn.MSELoss()
-    
-    os.makedirs(config.train.save_model_root, exist_ok=True)
-    cur_save_dir = os.path.join(config.train.save_model_root, f'{config.data.dataset}_{config.model.model}')
-    os.makedirs(cur_save_dir, exist_ok=True)
     
     best_mpjpe = 1000000
     best_p_mpjpe = 1000000
@@ -88,9 +125,15 @@ if __name__ == '__main__':
                 epoch_p_mpjpe.update(batch_p_mpjpe, inputs.size(0))
                 pbar.update(1)
                 pbar.set_postfix(**{'loss (batch)': loss.item(), 'mpjpe': batch_mpjpe, 'p-mpjpe': batch_p_mpjpe})
+                writer.add_scalar('train/loss', loss.item(), epoch*len(train_loader) + pbar.n)
+                writer.add_scalar('train/mpjpe', batch_mpjpe, epoch*len(train_loader) + pbar.n)
+                writer.add_scalar('train/p-mpjpe', batch_p_mpjpe, epoch*len(train_loader) + pbar.n)
         
-        print('Epoch:{}, Loss:{:.9f}, MPJPE:{:.4f}, P-MPJPE:{:.4f}'.format(
+        logger.info('Epoch:{}, Loss:{:.9f}, MPJPE:{:.4f}, P-MPJPE:{:.4f}'.format(
             epoch + 1, epoch_loss.avg, epoch_mpjpe.avg, epoch_p_mpjpe.avg))
+        writer.add_scalar('train/epoch_loss', epoch_loss.avg, epoch)
+        writer.add_scalar('train/epoch_mpjpe', epoch_mpjpe.avg, epoch)
+        writer.add_scalar('train/epoch_p-mpjpe', epoch_p_mpjpe.avg, epoch)
     
         if epoch % config.train.test_freq == 0:
             model.eval()
@@ -112,16 +155,20 @@ if __name__ == '__main__':
                     test_mpjpe.update(mpjpe(outputs, labels).item()*1e3, inputs.size(0))
                     test_p_mpjpe.update(p_mpjpe(outputs, labels).item()*1e3, inputs.size(0))
             
-            print('Test Loss:{:.9f}, MPJPE:{:.4f}, P-MPJPE:{:.4f}'.format(
+            logger.info('Test Loss:{:.9f}, MPJPE:{:.4f}, P-MPJPE:{:.4f}'.format(
                 test_loss.avg, test_mpjpe.avg, test_p_mpjpe.avg))
+            writer.add_scalar('test/loss', test_loss.avg, epoch)
+            writer.add_scalar('test/mpjpe', test_mpjpe.avg, epoch)
+            writer.add_scalar('test/p-mpjpe', test_p_mpjpe.avg, epoch)
             if test_mpjpe.avg < best_mpjpe:
                 best_mpjpe = test_mpjpe.avg
-                torch.save(model.state_dict(), os.path.join(cur_save_dir, 
+                torch.save(model.state_dict(), os.path.join(checkpoint_dir, 
                                                             f'epoch{epoch}_mpjpe{test_mpjpe.avg:.4f}_pmpjpe{test_p_mpjpe.avg:.4f}.pth'))
             if test_p_mpjpe.avg < best_p_mpjpe:
                 best_p_mpjpe = test_p_mpjpe.avg
-                torch.save(model.state_dict(), os.path.join(cur_save_dir, 
+                torch.save(model.state_dict(), os.path.join(checkpoint_dir, 
                                                             f'epoch{epoch}_mpjpe{test_mpjpe.avg:.4f}_pmpjpe{test_p_mpjpe.avg:.4f}.pth'))
                 
-                
+    writer.close()
+    logger.info(f"Training done, best MPJPE: {best_mpjpe:.4f}, best P-MPJPE: {best_p_mpjpe:.4f}")          
                 

@@ -1,4 +1,5 @@
 import argparse
+import datetime
 
 def dict2namespace(config):
     namespace = argparse.Namespace()
@@ -26,3 +27,6 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+def get_current_time() -> str:
+    return datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
