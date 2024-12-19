@@ -187,13 +187,14 @@ class MMFi(Dataset):
         config (Object): The configuration class object for the MMFi dataset.
     """
     def __init__(self, root, split, config, device=None, 
-                 merge_nframes=5, npoints=60):
+                 merge_nframes=5, npoints=60, move_to_center=False):
         super().__init__()
         self.root = root
         self.split = split
         self.device = device
         self.merge_nframes = merge_nframes 
         self.npoints = npoints
+        self.move_to_center = move_to_center
         self.subject_action_dict = self.decode_config(config)[split]
         self.scenes = {}
         self.subjects = {}
@@ -314,7 +315,7 @@ class MMFi(Dataset):
     def load_data(self):
         data_info = []
         for subject, actions in self.subject_action_dict.items():
-            print(subject, actions)
+            # print(subject, actions)
             for action in actions:
                 if self.data_unit == 'sequence':
                     data_dict = {
@@ -397,6 +398,17 @@ class MMFi(Dataset):
                 raw_data = f.read()
             radar_data = np.frombuffer(raw_data, dtype=np.float64)
             radar_data = radar_data.copy().reshape(-1, 5)
+            if self.move_to_center:
+                # change center to origin
+                if radar_data.shape[0] > 0:
+                    radar_coords = radar_data[:, :3]
+                    radar_center = np.mean(radar_coords, axis=0)
+                    radar_data[:, :3] = radar_coords - radar_center
+                    radar_data = cropping(radar_data)
+                    radar_coords = radar_data[:, :3]
+                    radar_center = np.mean(radar_coords, axis=0)
+                    radar_data[:, :3] = radar_coords - radar_center
+                
             radar_data_list.append(radar_data)
             # print(radar_data.shape, radar_data)
         data = np.concatenate(radar_data_list, axis=0)

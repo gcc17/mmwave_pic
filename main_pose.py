@@ -22,6 +22,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='configs/mmbody_point_transformer.yaml', help='path to config file')
     parser.add_argument('--model_ckpt_path', type=str, default=None, help='Path to the model checkpoint to load.')
+    parser.add_argument('--center_mmfi', action='store_true', help='Whether to center the mmfi dataset.')
     args = parser.parse_args()
     
     # parse config file
@@ -54,8 +55,13 @@ if __name__ == '__main__':
     else:
         test_noise_name = config.data.test_noise_level
     if not config.data.dataset == 'mmPoseNLP':
-        checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
-            f'{config.data.dataset}-{config.model.model}-{CURRENT_TIME}')
+        if config.data.dataset == 'MMFi':
+            center_name = 'center' if args.center_mmfi else 'original'
+            checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
+                f'{config.data.dataset}-{config.model.model}-{center_name}-{CURRENT_TIME}')
+        else:
+            checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
+                f'{config.data.dataset}-{config.model.model}-{CURRENT_TIME}')
     else:
         checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
             f'{config.data.dataset}-{config.model.model}-trainnoise{train_noise_name}-testnoise{test_noise_name}-{CURRENT_TIME}')
@@ -72,8 +78,8 @@ if __name__ == '__main__':
         dataset_config_path = os.path.join('datasets', 'mmfi.yaml')
         with open(dataset_config_path, 'r') as fd:
             dataset_config = yaml.load(fd, Loader=yaml.FullLoader)
-        train_dataset = datasets.__dict__[config.data.dataset](config.data.dataset_root, split='train', config=dataset_config, device=device)
-        test_dataset = datasets.__dict__[config.data.dataset](config.data.dataset_root, split='test', config=dataset_config, device=device)
+        train_dataset = datasets.__dict__[config.data.dataset](config.data.dataset_root, split='train', config=dataset_config, device=device, move_to_center=args.center_mmfi)
+        test_dataset = datasets.__dict__[config.data.dataset](config.data.dataset_root, split='test', config=dataset_config, device=device, move_to_center=args.center_mmfi)
     elif config.data.dataset == 'mmPoseNLP':
         train_data_path = os.path.join('datasets', 'merged_data', 'train_data.npy')
         test_data_path = os.path.join('datasets', 'merged_data', 'test_data.npy')

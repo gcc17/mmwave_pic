@@ -1,9 +1,10 @@
 import matplotlib.pyplot as plt
 import torch
 import numpy as np
-from mmWaveDataset import MMBody, MiliPointPose, mmPoseNLP
+from mmWaveDataset import MMBody, MiliPointPose, mmPoseNLP, MMFi
 import os
 import plotly.graph_objs as go
+import yaml
 
 def plot_3d_graph(tensor1, tensor2, elev=-45, azim=-135, roll=45, save_path=None):
     if torch.is_tensor(tensor1):
@@ -103,6 +104,18 @@ if __name__ == '__main__':
     #     input, label = mmbody_dataset.__getitem__(i)
     #     label = label - label[:1, :]
     #     plot_3d_graph(label, input, save_path=os.path.join(image_dir, f'{i}.png'))
+    
+    root = '../../mmfi/MMFi_dataset/MMFi_Dataset/Unzipfiles'
+    dataset_config_path = 'mmfi.yaml'
+    with open(dataset_config_path, 'r') as fd:
+        dataset_config = yaml.load(fd, Loader=yaml.FullLoader)
+    mmfi_dataset = MMFi(root, split='train', config=dataset_config, device='cuda', move_to_center=False)
+    image_dir = 'images_mmfi_ori'
+    os.makedirs(image_dir, exist_ok=True)
+    for i in range(len(mmfi_dataset)):
+        input, label = mmfi_dataset.__getitem__(i)
+        label = label - label[:1, :]
+        plot_3d_graph(label, input, save_path=os.path.join(image_dir, f'{i}.png'))
 
     # raw_data_dir = '../../MiliPoint/data/raw'
     # mili_dataset = MiliPointPose(raw_data_dir, split='train', device='cuda')
@@ -117,10 +130,10 @@ if __name__ == '__main__':
     # print(train_data1.shape)
     # plot_3d_nlp(train_data1[0])
     
-    train_data_path = os.path.join('merged_data', 'frames4_test.npy')
-    pose_dataset = mmPoseNLP(train_data_path)
-    image_dir = 'images_poseNLP4'
-    os.makedirs(image_dir, exist_ok=True)
-    for i in range(10):
-        input, label = pose_dataset.__getitem__(i)
-        plot_3d_graph(label, input, save_path=os.path.join(image_dir, f'{i}.png'))
+    # train_data_path = os.path.join('merged_data', 'frames4_test.npy')
+    # pose_dataset = mmPoseNLP(train_data_path)
+    # image_dir = 'images_poseNLP4'
+    # os.makedirs(image_dir, exist_ok=True)
+    # for i in range(10):
+    #     input, label = pose_dataset.__getitem__(i)
+    #     plot_3d_graph(label, input, save_path=os.path.join(image_dir, f'{i}.png'))
