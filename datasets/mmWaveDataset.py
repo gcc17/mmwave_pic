@@ -315,7 +315,7 @@ class MMFi(Dataset):
     def load_data(self):
         data_info = []
         for subject, actions in self.subject_action_dict.items():
-            # print(subject, actions)
+            print(subject, actions)
             for action in actions:
                 if self.data_unit == 'sequence':
                     data_dict = {

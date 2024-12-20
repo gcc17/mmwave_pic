@@ -22,4 +22,25 @@ class KMeansSampling(Strategy):
         
         self.coreset_dataset.set_indices(q_idxs)
         return q_idxs
+
+    def query_stepbystep(self, n):
+        self.model.eval()
+        selected_indices = self.coreset_dataset.selected_indices
+        unselected_indices = np.array([i for i in range(len(self.coreset_dataset.ori_dataset)) if i not in selected_indices])
+        self.coreset_dataset.set_indices(unselected_indices)
+        unselected_feature_embeddings = self.model.get_feature_embeddings(self.coreset_dataset)
+        unselected_feature_embeddings = unselected_feature_embeddings.detach().cpu().numpy()
+        # perform k-means clustering
+        cluster_learner = KMeans(n_clusters=n, random_state=0)
+        cluster_learner.fit(unselected_feature_embeddings)
+        cluster_idxs = cluster_learner.predict(unselected_feature_embeddings)
+        centers = cluster_learner.cluster_centers_[cluster_idxs]
+        dis = np.linalg.norm(unselected_feature_embeddings - centers, axis=1)
+        q_idxs = np.array([np.arange(unselected_feature_embeddings.shape[0])[cluster_idxs==i][dis[cluster_idxs==i].argmin()] for i in range(n)])
+        q_idxs = unselected_indices[q_idxs]
+        
+        # merge the two list
+        cur_indices = np.concatenate((selected_indices, q_idxs))
+        self.coreset_dataset.set_indices(cur_indices)
+        return cur_indices
         
