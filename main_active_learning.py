@@ -3,7 +3,9 @@ import os
 import yaml
 import torch
 import datasets
+from datasets import CoresetWrapper
 import models
+import strategies
 from utils import dict2namespace, AverageMeter, get_current_time
 from torch.utils.data import DataLoader
 from torch import optim
@@ -16,7 +18,6 @@ import logging
 import sys
 
 CURRENT_TIME: str = get_current_time()
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -31,7 +32,7 @@ if __name__ == '__main__':
     config = dict2namespace(config)
     
     # set up logging
-    log_dir = 'pic_logs'
+    log_dir = 'al_logs'
     os.makedirs(log_dir, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
@@ -54,14 +55,15 @@ if __name__ == '__main__':
         test_noise_name = '_'.join([str(n) for n in config.data.test_noise_level])
     else:
         test_noise_name = config.data.test_noise_level
+    select_name = f'method{config.strategy.method}_ratio{config.strategy.select_ratio}'
     if not config.data.dataset == 'mmPoseNLP':
         if config.data.dataset == 'MMFi':
             center_name = 'center' if args.center_mmfi else 'original'
             checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
-                f'{config.data.dataset}-{config.model.model}-{center_name}-{CURRENT_TIME}')
+                f'{select_name}-{config.data.dataset}-{config.model.model}-{center_name}-{CURRENT_TIME}')
         else:
             checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
-                f'{config.data.dataset}-{config.model.model}-{CURRENT_TIME}')
+                f'{select_name}-{config.data.dataset}-{config.model.model}-{CURRENT_TIME}')
     else:
         checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
             f'{config.data.dataset}-{config.model.model}-trainnoise{train_noise_name}-testnoise{test_noise_name}-{CURRENT_TIME}')
@@ -85,9 +87,9 @@ if __name__ == '__main__':
         test_data_path = os.path.join('datasets', 'merged_data', 'test_data.npy')
         train_dataset = datasets.__dict__[config.data.dataset](train_data_path, noise_level=[0.05,0.1,0.2])
         test_dataset = datasets.__dict__[config.data.dataset](test_data_path, noise_level=0.25)
-        
-    logger.info(f"Training on {len(train_dataset)} samples, Testing on {len(test_dataset)} samples")
-    train_loader = DataLoader(train_dataset, batch_size=config.train.batch_size, shuffle=True)
+    
+    train_coreset = CoresetWrapper(train_dataset)
+    train_loader = DataLoader(train_coreset, batch_size=config.train.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=config.train.batch_size, shuffle=False)
     
     # set up model
@@ -99,10 +101,19 @@ if __name__ == '__main__':
     grad_scaler = torch.cuda.amp.GradScaler(enabled=config.train.amp)
     criterion = nn.MSELoss()
     
+    # set up strategy
+    strategy = strategies.__dict__[config.strategy.method](train_coreset, model)
+    select_cnt = int(len(train_dataset) * config.strategy.select_ratio)
+    logger.info(f"Select {select_cnt} samples for each iteration.")
+    
     best_mpjpe = 1000000
     best_p_mpjpe = 1000000
     for epoch in range(config.train.n_epochs):
+        if epoch % config.strategy.select_freq == 0:
+            strategy.query(select_cnt)
+        
         model.train()
+        logger.info(f"train data batches {len(train_loader)}")
         epoch_loss = AverageMeter()
         epoch_mpjpe = AverageMeter()
         epoch_p_mpjpe = AverageMeter()
@@ -140,7 +151,7 @@ if __name__ == '__main__':
         writer.add_scalar('train/epoch_loss', epoch_loss.avg, epoch)
         writer.add_scalar('train/epoch_mpjpe', epoch_mpjpe.avg, epoch)
         writer.add_scalar('train/epoch_p-mpjpe', epoch_p_mpjpe.avg, epoch)
-    
+        
         if epoch % config.train.test_freq == 0:
             model.eval()
             test_loss = AverageMeter()
@@ -177,4 +188,8 @@ if __name__ == '__main__':
                 
     writer.close()
     logger.info(f"Training done, best MPJPE: {best_mpjpe:.4f}, best P-MPJPE: {best_p_mpjpe:.4f}")          
-                
+        
+            
+    
+    
+    
