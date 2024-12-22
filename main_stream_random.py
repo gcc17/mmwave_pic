@@ -2,6 +2,7 @@ import argparse
 import os
 import yaml
 import torch
+import numpy as np
 import datasets
 from datasets import CoresetWrapper
 import models
@@ -21,9 +22,11 @@ CURRENT_TIME: str = get_current_time()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/mmbody_stream_step.yaml', help='path to config file')
+    parser.add_argument('--config', type=str, default='configs/mmbody_point_transformer.yaml', help='path to config file')
     parser.add_argument('--model_ckpt_path', type=str, default=None, help='Path to the model checkpoint to load.')
     parser.add_argument('--center_mmfi', action='store_true', help='Whether to center the mmfi dataset.')
+    parser.add_argument('--random_ratio', type=float, help='The ratio of random samples in the coreset.')
+    parser.add_argument('--random_seed', type=int, default=420, help='The random seed for coreset selection.')
     args = parser.parse_args()
     
     # parse config file
@@ -32,7 +35,7 @@ if __name__ == '__main__':
     config = dict2namespace(config)
     
     # set up logging
-    log_dir = 'al_stream_step_logs'
+    log_dir = 'stream_random_logs'
     os.makedirs(log_dir, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
@@ -55,7 +58,7 @@ if __name__ == '__main__':
         test_noise_name = '_'.join([str(n) for n in config.data.test_noise_level])
     else:
         test_noise_name = config.data.test_noise_level
-    select_name = f'method{config.strategy.method}_ratio{config.strategy.select_ratio}'
+    select_name = f'ratio{args.random_ratio}_seed{args.random_seed}'
     if not config.data.dataset == 'mmPoseNLP':
         if config.data.dataset == 'MMFi':
             center_name = 'center' if args.center_mmfi else 'original'
@@ -89,6 +92,13 @@ if __name__ == '__main__':
         test_dataset = datasets.__dict__[config.data.dataset](test_data_path, noise_level=0.25)
     
     train_coreset = CoresetWrapper(train_dataset)
+    # select random samples from coreset
+    # random seed
+    np.random.seed(args.random_seed)
+    random_cnt = int(len(train_dataset) * args.random_ratio)
+    random_indices = np.random.choice(random_cnt*2, random_cnt, replace=False)
+    logger.info(f"random indices: {random_indices}")
+    train_coreset.set_indices(random_indices)
     train_loader = DataLoader(train_coreset, batch_size=config.train.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=config.train.batch_size, shuffle=False)
     
@@ -101,21 +111,10 @@ if __name__ == '__main__':
     grad_scaler = torch.cuda.amp.GradScaler(enabled=config.train.amp)
     criterion = nn.MSELoss()
     
-    # set up strategy
-    strategy = strategies.__dict__[config.strategy.method](train_coreset, model)
-    select_cnt = int(len(train_dataset) * config.strategy.select_ratio)
-    each_iter_select_cnt = select_cnt // (config.train.n_epochs // config.strategy.select_freq)
-    each_iter_stream_ratio = config.strategy.select_freq / config.train.n_epochs
-    logger.info(f"Select {each_iter_select_cnt} samples for each iteration and total {select_cnt} samples.")
-    
     best_mpjpe = 1000000
     best_p_mpjpe = 1000000
     select_iter = 0
     for epoch in range(config.train.n_epochs):
-        if epoch % config.strategy.select_freq == 0:
-            select_iter += 1
-            strategy.query_stream_stepbystep(each_iter_select_cnt, each_iter_stream_ratio * select_iter)
-            logger.info(f'current selected_indices: {strategy.coreset_dataset.selected_indices}')
         
         if epoch > 0 and epoch % config.train.test_freq == 0:
             model.eval()

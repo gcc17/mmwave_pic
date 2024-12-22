@@ -11,7 +11,7 @@ data:
 
 train: 
     batch_size: 16
-    n_epochs: 6
+    n_epochs: 100
     learning_rate: 0.0001
     weight_decay: 0.00000001
     gradient_clipping: 1.0
@@ -20,7 +20,7 @@ train:
 
 model:
     model: "PointTransformer"
-    checkpoint_root_dir: "random_checkpoints"
+    checkpoint_root_dir: "stream_random_checkpoints"
 
 strategy:
     method: "KMeansSampling"

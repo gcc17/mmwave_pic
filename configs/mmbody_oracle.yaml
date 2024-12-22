@@ -20,10 +20,8 @@ train:
 
 model:
     model: "PointTransformer"
-    checkpoint_root_dir: "random_checkpoints"
+    checkpoint_root_dir: "oracle_checkpoints"
 
 strategy:
     method: "KMeansSampling"
-    select_ratio: 0.5
-    select_freq: 5
     
