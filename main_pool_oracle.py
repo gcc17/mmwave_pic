@@ -2,6 +2,7 @@ import argparse
 import os
 import yaml
 import torch
+import numpy as np
 import datasets
 from datasets import CoresetWrapper
 import models
@@ -21,9 +22,10 @@ CURRENT_TIME: str = get_current_time()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/mmbody_point_transformer.yaml', help='path to config file')
+    parser.add_argument('--config', type=str, default='configs/pool_oracle.yaml', help='path to config file')
     parser.add_argument('--model_ckpt_path', type=str, default=None, help='Path to the model checkpoint to load.')
     parser.add_argument('--center_mmfi', action='store_true', help='Whether to center the mmfi dataset.')
+    parser.add_argument('--select_ratio', type=float, help='The ratio of random samples in the coreset.')
     args = parser.parse_args()
     
     # parse config file
@@ -32,7 +34,7 @@ if __name__ == '__main__':
     config = dict2namespace(config)
     
     # set up logging
-    log_dir = 'al_logs'
+    log_dir = 'pool_oracle_logs'
     os.makedirs(log_dir, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
@@ -47,26 +49,14 @@ if __name__ == '__main__':
     logger.info(config)
     
     # set up tensorboard
-    if isinstance(config.data.train_noise_level, list):
-        train_noise_name = '_'.join([str(n) for n in config.data.train_noise_level])
-    else:
-        train_noise_name = config.data.train_noise_level
-    if isinstance(config.data.test_noise_level, list):
-        test_noise_name = '_'.join([str(n) for n in config.data.test_noise_level])
-    else:
-        test_noise_name = config.data.test_noise_level
     select_name = f'method{config.strategy.method}_ratio{config.strategy.select_ratio}'
-    if not config.data.dataset == 'mmPoseNLP':
-        if config.data.dataset == 'MMFi':
-            center_name = 'center' if args.center_mmfi else 'original'
-            checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
-                f'{select_name}-{config.data.dataset}-{config.model.model}-{center_name}-{CURRENT_TIME}')
-        else:
-            checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
-                f'{select_name}-{config.data.dataset}-{config.model.model}-{CURRENT_TIME}')
+    if config.data.dataset == 'MMFi':
+        center_name = 'center' if args.center_mmfi else 'original'
+        checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
+            f'{select_name}-{config.data.dataset}-{config.model.model}-{center_name}-{CURRENT_TIME}')
     else:
         checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
-            f'{config.data.dataset}-{config.model.model}-trainnoise{train_noise_name}-testnoise{test_noise_name}-{CURRENT_TIME}')
+            f'{select_name}-{config.data.dataset}-{config.model.model}-{CURRENT_TIME}')
     os.makedirs(checkpoint_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=checkpoint_dir)
     logger.info(f"Writing tensorboard logs to {checkpoint_dir}")
@@ -82,11 +72,6 @@ if __name__ == '__main__':
             dataset_config = yaml.load(fd, Loader=yaml.FullLoader)
         train_dataset = datasets.__dict__[config.data.dataset](config.data.dataset_root, split='train', config=dataset_config, device=device, move_to_center=args.center_mmfi)
         test_dataset = datasets.__dict__[config.data.dataset](config.data.dataset_root, split='test', config=dataset_config, device=device, move_to_center=args.center_mmfi)
-    elif config.data.dataset == 'mmPoseNLP':
-        train_data_path = os.path.join('datasets', 'merged_data', 'train_data.npy')
-        test_data_path = os.path.join('datasets', 'merged_data', 'test_data.npy')
-        train_dataset = datasets.__dict__[config.data.dataset](train_data_path, noise_level=[0.05,0.1,0.2])
-        test_dataset = datasets.__dict__[config.data.dataset](test_data_path, noise_level=0.25)
     
     train_coreset = CoresetWrapper(train_dataset)
     train_loader = DataLoader(train_coreset, batch_size=config.train.batch_size, shuffle=True)
@@ -94,7 +79,8 @@ if __name__ == '__main__':
     
     # set up model
     model = models.__dict__[config.model.model](device=device, input_dim=config.data.radar_input_c, n_p=config.data.num_joints).to(device)
-    # print(model)
+    feat_model = models.__dict__[config.model.model](device=device, input_dim=config.data.radar_input_c, n_p=config.data.num_joints).to(device)
+    feat_model.load_state_dict(torch.load(args.model_ckpt_path, map_location=device))
     # set up optimizer
     optimizer = optim.Adam(model.parameters(),
                            lr=config.train.learning_rate, weight_decay=config.train.weight_decay, foreach=True)
@@ -102,16 +88,62 @@ if __name__ == '__main__':
     criterion = nn.MSELoss()
     
     # set up strategy
-    strategy = strategies.__dict__[config.strategy.method](train_coreset, model)
+    strategy = strategies.__dict__[config.strategy.method](train_coreset, feat_model)
     select_cnt = int(len(train_dataset) * config.strategy.select_ratio)
-    logger.info(f"Select {select_cnt} samples for each iteration.")
+    each_iter_select_cnt = select_cnt // (config.train.n_epochs // config.strategy.select_freq)
+    logger.info(f"Select {each_iter_select_cnt} samples for each iteration and total {select_cnt} samples.")
     
     best_mpjpe = 1000000
     best_p_mpjpe = 1000000
+    select_iter = 0
     for epoch in range(config.train.n_epochs):
-        if epoch % config.strategy.select_freq == 0:
-            strategy.query(select_cnt)
+        # testing
+        if (epoch > 0 and epoch % config.train.test_freq == 0) or (epoch == config.train.n_epochs - 1):
+            model.eval()
+            test_loss = AverageMeter()
+            test_mpjpe = AverageMeter()
+            test_p_mpjpe = AverageMeter()
+            with torch.no_grad():
+                for data in tqdm(test_loader):
+                    inputs, labels = data
+                    labels = labels[:,:,:] - labels[:,:1,:]
+                    inputs = inputs.type(torch.FloatTensor).to(device)
+                    labels = labels.type(torch.FloatTensor).to(device)
+                    
+                    outputs, feat = model(inputs)
+                    outputs = outputs.type(torch.FloatTensor).to(device)
+                    loss = criterion(outputs, labels)
+                    
+                    test_loss.update(loss.item(), inputs.size(0))
+                    test_mpjpe.update(mpjpe(outputs, labels).item()*1e3, inputs.size(0))
+                    test_p_mpjpe.update(p_mpjpe(outputs, labels).item()*1e3, inputs.size(0))
+            
+            logger.info('Test Loss:{:.9f}, MPJPE:{:.4f}, P-MPJPE:{:.4f}'.format(
+                test_loss.avg, test_mpjpe.avg, test_p_mpjpe.avg))
+            writer.add_scalar('test/loss', test_loss.avg, epoch)
+            writer.add_scalar('test/mpjpe', test_mpjpe.avg, epoch)
+            writer.add_scalar('test/p-mpjpe', test_p_mpjpe.avg, epoch)
+            if test_mpjpe.avg < best_mpjpe:
+                best_mpjpe = test_mpjpe.avg
+            if test_p_mpjpe.avg < best_p_mpjpe:
+                best_p_mpjpe = test_p_mpjpe.avg
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, 
+                                                        f'epoch{epoch}_mpjpe{test_mpjpe.avg:.4f}_pmpjpe{test_p_mpjpe.avg:.4f}.pth'))
         
+        # update training set
+        if epoch % config.strategy.select_freq == 0:
+            if epoch == 0:
+                train_coreset.set_indices(np.array([]))
+                new_indices = strategy.query(each_iter_select_cnt)
+                selected_indices = new_indices
+            else:
+                new_indices = strategy.query(each_iter_select_cnt)
+                selected_indices = np.concatenate((train_coreset.selected_indices, new_indices))
+            train_coreset.set_indices(selected_indices)
+            unique_selected_indices = np.unique(selected_indices)
+            logger.info(f'before unique {len(selected_indices)} after unique {len(unique_selected_indices)}')
+            logger.info(f'new_indices: {len(new_indices)} {new_indices}, current selected_indices: {len(train_coreset.selected_indices)} {train_coreset.selected_indices}')
+                
         model.train()
         logger.info(f"train data batches {len(train_loader)}")
         epoch_loss = AverageMeter()
@@ -152,40 +184,7 @@ if __name__ == '__main__':
         writer.add_scalar('train/epoch_mpjpe', epoch_mpjpe.avg, epoch)
         writer.add_scalar('train/epoch_p-mpjpe', epoch_p_mpjpe.avg, epoch)
         
-        if epoch % config.train.test_freq == 0:
-            model.eval()
-            test_loss = AverageMeter()
-            test_mpjpe = AverageMeter()
-            test_p_mpjpe = AverageMeter()
-            with torch.no_grad():
-                for data in test_loader:
-                    inputs, labels = data
-                    labels = labels[:,:,:] - labels[:,:1,:]
-                    inputs = inputs.type(torch.FloatTensor).to(device)
-                    labels = labels.type(torch.FloatTensor).to(device)
-                    
-                    outputs, feat = model(inputs)
-                    outputs = outputs.type(torch.FloatTensor).to(device)
-                    loss = criterion(outputs, labels)
-                    
-                    test_loss.update(loss.item(), inputs.size(0))
-                    test_mpjpe.update(mpjpe(outputs, labels).item()*1e3, inputs.size(0))
-                    test_p_mpjpe.update(p_mpjpe(outputs, labels).item()*1e3, inputs.size(0))
-            
-            logger.info('Test Loss:{:.9f}, MPJPE:{:.4f}, P-MPJPE:{:.4f}'.format(
-                test_loss.avg, test_mpjpe.avg, test_p_mpjpe.avg))
-            writer.add_scalar('test/loss', test_loss.avg, epoch)
-            writer.add_scalar('test/mpjpe', test_mpjpe.avg, epoch)
-            writer.add_scalar('test/p-mpjpe', test_p_mpjpe.avg, epoch)
-            if test_mpjpe.avg < best_mpjpe:
-                best_mpjpe = test_mpjpe.avg
-                torch.save(model.state_dict(), os.path.join(checkpoint_dir, 
-                                                            f'epoch{epoch}_mpjpe{test_mpjpe.avg:.4f}_pmpjpe{test_p_mpjpe.avg:.4f}.pth'))
-            if test_p_mpjpe.avg < best_p_mpjpe:
-                best_p_mpjpe = test_p_mpjpe.avg
-                torch.save(model.state_dict(), os.path.join(checkpoint_dir, 
-                                                            f'epoch{epoch}_mpjpe{test_mpjpe.avg:.4f}_pmpjpe{test_p_mpjpe.avg:.4f}.pth'))
-                
+        
     writer.close()
     logger.info(f"Training done, best MPJPE: {best_mpjpe:.4f}, best P-MPJPE: {best_p_mpjpe:.4f}")          
         

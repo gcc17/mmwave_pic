@@ -7,8 +7,3 @@ class Strategy:
     def query(self, n):
         pass
     
-    def query_stepbystep(self, n):
-        pass
-    
-    def query_stream_stepbystep(self, n, seen_ratio):
-        pass

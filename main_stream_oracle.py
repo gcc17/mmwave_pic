@@ -22,7 +22,7 @@ CURRENT_TIME: str = get_current_time()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/mmbody_point_transformer.yaml', help='path to config file')
+    parser.add_argument('--config', type=str, default='configs/stream_oracle.yaml', help='path to config file')
     parser.add_argument('--model_ckpt_path', type=str, default=None, help='Path to the model checkpoint to load.')
     parser.add_argument('--center_mmfi', action='store_true', help='Whether to center the mmfi dataset.')
     parser.add_argument('--select_ratio', type=float, help='The ratio of random samples in the coreset.')
@@ -49,26 +49,14 @@ if __name__ == '__main__':
     logger.info(config)
     
     # set up tensorboard
-    if isinstance(config.data.train_noise_level, list):
-        train_noise_name = '_'.join([str(n) for n in config.data.train_noise_level])
-    else:
-        train_noise_name = config.data.train_noise_level
-    if isinstance(config.data.test_noise_level, list):
-        test_noise_name = '_'.join([str(n) for n in config.data.test_noise_level])
-    else:
-        test_noise_name = config.data.test_noise_level
-    select_name = f'ratio{args.select_ratio}'
-    if not config.data.dataset == 'mmPoseNLP':
-        if config.data.dataset == 'MMFi':
-            center_name = 'center' if args.center_mmfi else 'original'
-            checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
-                f'{select_name}-{config.data.dataset}-{config.model.model}-{center_name}-{CURRENT_TIME}')
-        else:
-            checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
-                f'{select_name}-{config.data.dataset}-{config.model.model}-{CURRENT_TIME}')
+    select_name = f'method{config.strategy.method}_ratio{config.strategy.select_ratio}'
+    if config.data.dataset == 'MMFi':
+        center_name = 'center' if args.center_mmfi else 'original'
+        checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
+            f'{select_name}-{config.data.dataset}-{config.model.model}-{center_name}-{CURRENT_TIME}')
     else:
         checkpoint_dir = os.path.join(config.model.checkpoint_root_dir, \
-            f'{config.data.dataset}-{config.model.model}-trainnoise{train_noise_name}-testnoise{test_noise_name}-{CURRENT_TIME}')
+            f'{select_name}-{config.data.dataset}-{config.model.model}-{CURRENT_TIME}')
     os.makedirs(checkpoint_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=checkpoint_dir)
     logger.info(f"Writing tensorboard logs to {checkpoint_dir}")
@@ -84,42 +72,33 @@ if __name__ == '__main__':
             dataset_config = yaml.load(fd, Loader=yaml.FullLoader)
         train_dataset = datasets.__dict__[config.data.dataset](config.data.dataset_root, split='train', config=dataset_config, device=device, move_to_center=args.center_mmfi)
         test_dataset = datasets.__dict__[config.data.dataset](config.data.dataset_root, split='test', config=dataset_config, device=device, move_to_center=args.center_mmfi)
-    elif config.data.dataset == 'mmPoseNLP':
-        train_data_path = os.path.join('datasets', 'merged_data', 'train_data.npy')
-        test_data_path = os.path.join('datasets', 'merged_data', 'test_data.npy')
-        train_dataset = datasets.__dict__[config.data.dataset](train_data_path, noise_level=[0.05,0.1,0.2])
-        test_dataset = datasets.__dict__[config.data.dataset](test_data_path, noise_level=0.25)
     
-    train_streamset = CoresetWrapper(train_dataset)
-    select_cnt = int(len(train_dataset) * args.select_ratio)
-    train_streamset.set_indices(np.array(range(2*select_cnt)))
-    train_coreset = CoresetWrapper(train_streamset)
-    # set up feature model to select coreset
-    feat_model = models.__dict__[config.model.model](device=device, input_dim=config.data.radar_input_c, n_p=config.data.num_joints).to(device)
-    feat_model.load_state_dict(torch.load(args.model_ckpt_path, map_location=device))
-    strategy = strategies.__dict__[config.strategy.method](train_coreset, feat_model)
-    strategy.query(select_cnt)
-    logger.info(f'select_cnt: {select_cnt}, coreset cnt: {len(train_coreset)}, streamset cnt: {len(train_streamset)}')
-    
+    train_coreset = CoresetWrapper(train_dataset)
     train_loader = DataLoader(train_coreset, batch_size=config.train.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=config.train.batch_size, shuffle=False)
     
     # set up model
     model = models.__dict__[config.model.model](device=device, input_dim=config.data.radar_input_c, n_p=config.data.num_joints).to(device)
-    
-    # print(model)
+    feat_model = models.__dict__[config.model.model](device=device, input_dim=config.data.radar_input_c, n_p=config.data.num_joints).to(device)
+    feat_model.load_state_dict(torch.load(args.model_ckpt_path, map_location=device))
     # set up optimizer
     optimizer = optim.Adam(model.parameters(),
                            lr=config.train.learning_rate, weight_decay=config.train.weight_decay, foreach=True)
     grad_scaler = torch.cuda.amp.GradScaler(enabled=config.train.amp)
     criterion = nn.MSELoss()
     
+    # set up strategy
+    select_cnt = int(len(train_dataset) * config.strategy.select_ratio)
+    each_iter_total_cnt = len(train_dataset) // (config.train.n_epochs // config.strategy.select_freq)
+    each_iter_select_cnt = select_cnt // (config.train.n_epochs // config.strategy.select_freq)
+    logger.info(f"Select {each_iter_select_cnt} samples for each iteration and total {select_cnt} samples.")
+    
     best_mpjpe = 1000000
     best_p_mpjpe = 1000000
     select_iter = 0
     for epoch in range(config.train.n_epochs):
-        
-        if epoch > 0 and epoch % config.train.test_freq == 0:
+        # testing
+        if (epoch > 0 and epoch % config.train.test_freq == 0) or (epoch == config.train.n_epochs - 1):
             model.eval()
             test_loss = AverageMeter()
             test_mpjpe = AverageMeter()
@@ -146,13 +125,33 @@ if __name__ == '__main__':
             writer.add_scalar('test/p-mpjpe', test_p_mpjpe.avg, epoch)
             if test_mpjpe.avg < best_mpjpe:
                 best_mpjpe = test_mpjpe.avg
-                torch.save(model.state_dict(), os.path.join(checkpoint_dir, 
-                                                            f'epoch{epoch}_mpjpe{test_mpjpe.avg:.4f}_pmpjpe{test_p_mpjpe.avg:.4f}.pth'))
             if test_p_mpjpe.avg < best_p_mpjpe:
                 best_p_mpjpe = test_p_mpjpe.avg
-                torch.save(model.state_dict(), os.path.join(checkpoint_dir, 
-                                                            f'epoch{epoch}_mpjpe{test_mpjpe.avg:.4f}_pmpjpe{test_p_mpjpe.avg:.4f}.pth'))
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, 
+                                                        f'epoch{epoch}_mpjpe{test_mpjpe.avg:.4f}_pmpjpe{test_p_mpjpe.avg:.4f}.pth'))
         
+        # update 
+        if epoch % config.strategy.select_freq == 0:
+            select_iter += 1
+            existing_selected_indices = train_coreset.selected_indices
+            total_indices = range(each_iter_total_cnt*(select_iter-1), each_iter_total_cnt*select_iter)
+            iter_all_coreset = CoresetWrapper(train_dataset)
+            iter_all_coreset.set_indices(np.array(total_indices))
+            train_coreset.ori_dataset = iter_all_coreset
+            train_coreset.set_indices(np.array([]))
+            strategy = strategies.__dict__[config.strategy.method](train_coreset, feat_model)
+            q_idxs = strategy.query(each_iter_select_cnt)
+            converted_selected_indices = np.array(total_indices)[q_idxs]
+            if epoch == 0:
+                selected_indices = converted_selected_indices
+            else:
+                selected_indices = np.concatenate((existing_selected_indices, converted_selected_indices))
+            train_coreset.ori_dataset = train_dataset
+            train_coreset.set_indices(selected_indices)
+            unique_selected_indices = np.unique(selected_indices)
+            logger.info(f'before unique {len(selected_indices)} after unique {len(unique_selected_indices)}')
+            logger.info(f"Converted indices length {len(converted_selected_indices)}, {converted_selected_indices}")
+            logger.info(f"Selected indices length {len(selected_indices)}, {selected_indices}")
         
         model.train()
         logger.info(f"train data batches {len(train_loader)}")

@@ -20,7 +20,7 @@ train:
 
 model:
     model: "PointTransformer"
-    checkpoint_root_dir: "stream_random_checkpoints"
+    checkpoint_root_dir: "pool_random_checkpoints"
 
 strategy:
     method: "KMeansSampling"

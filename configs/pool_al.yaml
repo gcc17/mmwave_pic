@@ -20,7 +20,7 @@ train:
 
 model:
     model: "PointTransformer"
-    checkpoint_root_dir: "stream_oracle_checkpoints"
+    checkpoint_root_dir: "pool_al_checkpoints"
 
 strategy:
     method: "KMeansSampling"
